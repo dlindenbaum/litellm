@@ -5,285 +5,72 @@ import TabItem from '@theme/TabItem';
 
 This guide covers how to get structured JSON output from vLLM models that **don't natively support** OpenAI's `response_format` or `tools` parameters.
 
-## When Do You Need This?
+## ⚠️ Current Implementation Status
 
-You need custom template configuration when:
+**IMPORTANT**: As of this writing, LiteLLM does **NOT** automatically inject JSON schema into prompts for vLLM models that don't support `response_format`.
 
-1. Your vLLM model doesn't support native JSON schema (`response_format`)
-2. Your vLLM model doesn't support function/tool calling
-3. You want to customize how JSON schema instructions are presented to the model
-4. You're using older or simpler models that lack structured output capabilities
+### What Currently Exists
 
-## How It Works
+- ✅ **Vertex AI Gemini** - Has automatic prompt injection when model doesn't support `response_schema`
+- ✅ **Function calling fallback** - Some providers can convert to tool calls
+- ❌ **vLLM automatic injection** - Not yet implemented
 
-LiteLLM has a **fallback mechanism** that injects JSON schema instructions directly into your conversation when the model doesn't support native structured output:
+### What Happens Now with vLLM
 
+```python
+# If you do this with a vLLM model that doesn't support response_format:
+response = litellm.completion(
+    model="hosted_vllm/my-model",
+    messages=[{"role": "user", "content": "Extract data"}],
+    response_format={"type": "json_schema", "json_schema": {...}}
+)
+
+# What actually happens:
+# 1. LiteLLM inherits OpenAI behavior (HostedVLLMChatConfig extends OpenAIGPTConfig)
+# 2. response_format is passed straight through to vLLM server
+# 3. If vLLM model doesn't support it → ignored or error
+# 4. NO automatic prompt injection occurs
 ```
-User Request:
-- messages: [{"role": "user", "content": "Extract user info"}]
-- response_format: {JSON schema}
 
-       ↓
+### Code Location
 
-LiteLLM detects model doesn't support response_format
+The automatic prompt injection that works for Gemini is in:
+- `/litellm/llms/vertex_ai/gemini/transformation.py` lines 463-472
 
-       ↓
-
-Adds schema to messages:
-- messages: [
-    {"role": "user", "content": "Extract user info"},
-    {"role": "user", "content": "Use this JSON schema: {...}"}
-  ]
-
-       ↓
-
-Sends to vLLM server
+```python
+# This logic ONLY exists for Vertex AI Gemini:
+if "response_schema" in optional_params:
+    supports_response_schema = get_supports_response_schema(
+        model=model, custom_llm_provider=custom_llm_provider
+    )
+    if supports_response_schema is False:
+        user_response_schema_message = response_schema_prompt(
+            model=model, response_schema=optional_params.get("response_schema")
+        )
+        messages.append({"role": "user", "content": user_response_schema_message})
+        optional_params.pop("response_schema")
 ```
+
+**This logic does NOT exist in** `/litellm/llms/hosted_vllm/chat/transformation.py`
 
 ---
 
-## Method 1: Register Model with Feature Flags (Recommended)
+## Current Workarounds for vLLM
 
-This is the cleanest approach for models you'll use repeatedly.
+Until automatic injection is implemented, here are your options:
 
-### Step 1: Register Your Model
+### Option 1: Manual Prompt Injection (Recommended)
 
-```python
-import litellm
-
-# Register model with explicit feature support flags
-litellm.register_model({
-    "hosted_vllm/my-custom-model": {
-        "max_tokens": 4096,
-        "max_input_tokens": 8192,
-        "max_output_tokens": 4096,
-        "input_cost_per_token": 0.0,
-        "output_cost_per_token": 0.0,
-        "litellm_provider": "hosted_vllm",
-        "mode": "chat",
-
-        # Feature flags - set these to False for models without support
-        "supports_function_calling": False,  # No tool/function calling
-        "supports_response_schema": False,   # No native JSON schema
-        "supports_vision": False,            # Set based on your model
-        "supports_assistant_prefill": True,  # Most models support this
-    }
-})
-```
-
-### Step 2: Use Normally with response_format
-
-```python
-from pydantic import BaseModel
-
-class UserInfo(BaseModel):
-    name: str
-    age: int
-    email: str
-    occupation: str
-
-# LiteLLM will automatically inject schema into prompt
-response = litellm.completion(
-    model="hosted_vllm/my-custom-model",
-    api_base="http://your-vllm-server:8000",
-    messages=[
-        {"role": "user", "content": "Extract: John Doe, 30, john@example.com, Engineer"}
-    ],
-    response_format=UserInfo  # Pydantic model
-)
-
-print(response.choices[0].message.content)
-```
-
-### Step 3: Or Use Dict Schema
-
-```python
-response = litellm.completion(
-    model="hosted_vllm/my-custom-model",
-    api_base="http://your-vllm-server:8000",
-    messages=[
-        {"role": "user", "content": "List three colors"}
-    ],
-    response_format={
-        "type": "json_schema",
-        "json_schema": {
-            "name": "color_list",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "colors": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    }
-                },
-                "required": ["colors"],
-                "additionalProperties": False
-            }
-        }
-    }
-)
-```
-
----
-
-## Method 2: Custom Prompt Templates
-
-For advanced control over how JSON schema is presented to your model.
-
-### Understanding the Default Template
-
-By default, LiteLLM uses this prompt:
-
-```python
-def default_response_schema_prompt(response_schema: dict) -> str:
-    prompt_str = """Use this JSON schema:
-    ```json
-    {}
-    ```""".format(response_schema)
-    return prompt_str
-```
-
-This gets **appended as a user message** after your original messages.
-
-### Creating a Custom Template
-
-You can customize this template to better match your model's training:
+Manually add the JSON schema to your messages:
 
 <Tabs>
-<TabItem value="global" label="Global Custom Template">
-
-```python
-import litellm
-
-# Apply to all models that use response_schema fallback
-litellm.custom_prompt_dict = {
-    "response_schema_prompt": {
-        "roles": {
-            "system": {
-                "pre_message": "",
-                "post_message": ""
-            },
-            "user": {
-                "pre_message": "You are a helpful assistant that outputs valid JSON.\n\n",
-                "post_message": "\n\nIMPORTANT: Your response must be ONLY valid JSON matching the schema above. Do not include markdown code blocks or explanations."
-            }
-        },
-        "initial_prompt_value": "RESPOND WITH VALID JSON ONLY.\n\n",
-        "final_prompt_value": "\n\nRemember: Output ONLY the JSON object, nothing else."
-    }
-}
-
-# Now all models without native support will use this template
-response = litellm.completion(
-    model="hosted_vllm/my-custom-model",
-    messages=[{"role": "user", "content": "Extract user data"}],
-    response_format={...}
-)
-```
-
-</TabItem>
-<TabItem value="model-specific" label="Model-Specific Template">
-
-```python
-import litellm
-
-# Apply only to specific model
-litellm.custom_prompt_dict = {
-    "hosted_vllm/my-custom-model/response_schema_prompt": {
-        "roles": {
-            "user": {
-                "pre_message": "### JSON Schema\n\n",
-                "post_message": "\n\n### Instructions\n- Output valid JSON only\n- Match the schema exactly\n- Use double quotes for strings\n- Do not add comments or markdown"
-            }
-        },
-        "initial_prompt_value": "",
-        "final_prompt_value": ""
-    }
-}
-
-response = litellm.completion(
-    model="hosted_vllm/my-custom-model",
-    messages=[{"role": "user", "content": "Extract data"}],
-    response_format={...}
-)
-```
-
-</TabItem>
-</Tabs>
-
-### Example: Structured Template for Better Results
-
-```python
-import litellm
-
-# Register model
-litellm.register_model({
-    "hosted_vllm/llama-3-8b": {
-        "supports_function_calling": False,
-        "supports_response_schema": False,
-    }
-})
-
-# Custom template optimized for instruction-following models
-litellm.custom_prompt_dict = {
-    "hosted_vllm/llama-3-8b/response_schema_prompt": {
-        "roles": {
-            "user": {
-                "pre_message": (
-                    "=== JSON OUTPUT REQUIRED ===\n\n"
-                    "You must respond with a valid JSON object that strictly follows this schema:\n\n"
-                ),
-                "post_message": (
-                    "\n\n=== OUTPUT RULES ===\n"
-                    "1. Output ONLY the JSON object\n"
-                    "2. Do NOT wrap in markdown code blocks\n"
-                    "3. Do NOT add explanations or comments\n"
-                    "4. Use proper JSON syntax (double quotes, commas, brackets)\n"
-                    "5. Match the schema exactly - all required fields must be present\n"
-                )
-            }
-        },
-        "initial_prompt_value": "",
-        "final_prompt_value": ""
-    }
-}
-
-# Use it
-from pydantic import BaseModel, Field
-
-class ProductReview(BaseModel):
-    rating: int = Field(description="Rating from 1-5")
-    sentiment: str = Field(description="positive, negative, or neutral")
-    summary: str = Field(description="Brief summary of the review")
-    key_points: list[str] = Field(description="List of key points mentioned")
-
-response = litellm.completion(
-    model="hosted_vllm/llama-3-8b",
-    api_base="http://localhost:8000",
-    messages=[
-        {
-            "role": "user",
-            "content": "Review: This product is amazing! Great quality, fast shipping, and excellent customer service. Highly recommend. 5 stars!"
-        }
-    ],
-    response_format=ProductReview
-)
-
-print(response.choices[0].message.content)
-```
-
----
-
-## Method 3: Manual Prompt Injection (Simplest)
-
-For one-off requests or maximum control:
+<TabItem value="basic" label="Basic Example">
 
 ```python
 import litellm
 import json
 
-# Tell LiteLLM to drop unsupported params silently
+# Enable dropping unsupported params
 litellm.drop_params = True
 
 schema = {
@@ -291,312 +78,476 @@ schema = {
     "properties": {
         "name": {"type": "string"},
         "age": {"type": "integer"},
-        "email": {"type": "string", "format": "email"}
+        "email": {"type": "string"}
     },
     "required": ["name", "age", "email"]
 }
 
+# Manually add schema instructions to messages
 messages = [
+    {
+        "role": "system",
+        "content": "You are a helpful assistant that outputs valid JSON only."
+    },
     {
         "role": "user",
         "content": "Extract user information: John Doe, 30 years old, john@example.com"
     },
     {
         "role": "user",
-        "content": f"Respond with JSON matching this schema:\n```json\n{json.dumps(schema, indent=2)}\n```"
+        "content": f"""You must respond with valid JSON matching this exact schema:
+
+```json
+{json.dumps(schema, indent=2)}
+```
+
+Important:
+- Output ONLY the JSON object
+- Do not include markdown code blocks
+- Do not add explanations
+- All required fields must be present"""
     }
 ]
 
 response = litellm.completion(
     model="hosted_vllm/my-model",
     api_base="http://localhost:8000",
-    messages=messages
+    messages=messages,
+    temperature=0
 )
+
+# Extract JSON from response
+result = json.loads(response.choices[0].message.content)
+print(result)
 ```
 
----
-
-## Complete Working Example
-
-Here's a full example you can run:
+</TabItem>
+<TabItem value="pydantic" label="With Pydantic">
 
 ```python
 import litellm
+import json
 from pydantic import BaseModel, Field
 from typing import List
-import json
 
-# 1. Register your vLLM model
-litellm.register_model({
-    "hosted_vllm/my-llama-model": {
-        "max_tokens": 4096,
-        "litellm_provider": "hosted_vllm",
-        "mode": "chat",
-        "supports_function_calling": False,
-        "supports_response_schema": False,
-    }
-})
+class ProductReview(BaseModel):
+    rating: int = Field(ge=1, le=5, description="Rating from 1-5")
+    sentiment: str = Field(description="positive, negative, or neutral")
+    summary: str = Field(description="Brief summary")
+    pros: List[str] = Field(description="List of positive points")
+    cons: List[str] = Field(description="List of negative points")
 
-# 2. Define custom template for better JSON output
-litellm.custom_prompt_dict = {
-    "hosted_vllm/my-llama-model/response_schema_prompt": {
-        "roles": {
-            "user": {
-                "pre_message": "📋 JSON SCHEMA REQUIRED:\n\n",
-                "post_message": (
-                    "\n\n✅ OUTPUT REQUIREMENTS:\n"
-                    "- Valid JSON only (no markdown, no explanations)\n"
-                    "- Match schema exactly\n"
-                    "- Include all required fields\n"
-                )
-            }
-        },
-        "initial_prompt_value": "",
-        "final_prompt_value": ""
-    }
-}
+# Convert Pydantic to JSON schema
+schema = ProductReview.model_json_schema()
 
-# 3. Define your data structure
-class Article(BaseModel):
-    title: str = Field(description="Article title")
-    author: str = Field(description="Author name")
-    tags: List[str] = Field(description="List of relevant tags")
-    word_count: int = Field(description="Approximate word count")
-    summary: str = Field(description="Brief 1-sentence summary")
+messages = [
+    {
+        "role": "user",
+        "content": "Review: Great product! Love the quality. A bit pricey though."
+    },
+    {
+        "role": "user",
+        "content": f"""Respond with JSON matching this schema:
 
-# 4. Make the request
-try:
-    response = litellm.completion(
-        model="hosted_vllm/my-llama-model",
-        api_base="http://localhost:8000",
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Analyze this article: "
-                    "'The Future of AI: A Deep Dive into Large Language Models. "
-                    "By Dr. Jane Smith. "
-                    "This comprehensive 2000-word article explores the latest developments "
-                    "in artificial intelligence, focusing on transformer architectures, "
-                    "training methodologies, and ethical considerations.'"
-                )
-            }
-        ],
-        response_format=Article,
-        temperature=0.7,
-        max_tokens=500
-    )
-
-    # Parse the response
-    result = json.loads(response.choices[0].message.content)
-    print("Structured output:")
-    print(json.dumps(result, indent=2))
-
-except Exception as e:
-    print(f"Error: {e}")
+```json
+{json.dumps(schema, indent=2)}
 ```
 
----
+Output only valid JSON, no other text."""
+    }
+]
 
-## Configuration with LiteLLM Proxy
-
-You can also configure this in your proxy `config.yaml`:
-
-```yaml
-model_list:
-  - model_name: my-vllm-model
-    litellm_params:
-      model: hosted_vllm/llama-3-8b
-      api_base: http://localhost:8000
-      supports_function_calling: false
-      supports_response_schema: false
-
-general_settings:
-  # Enable prompt injection for unsupported models
-  add_function_to_prompt: true
-
-  # Custom prompts (optional)
-  custom_prompt_dict:
-    "hosted_vllm/llama-3-8b/response_schema_prompt":
-      roles:
-        user:
-          pre_message: "JSON Schema Required:\n\n"
-          post_message: "\n\nOutput valid JSON only."
-```
-
-Then use via proxy:
-
-```python
-import openai
-
-client = openai.OpenAI(
-    api_key="sk-1234",
-    base_url="http://0.0.0.0:4000"
+response = litellm.completion(
+    model="hosted_vllm/llama-3-8b",
+    api_base="http://localhost:8000",
+    messages=messages
 )
 
-response = client.chat.completions.create(
-    model="my-vllm-model",
-    messages=[{"role": "user", "content": "Extract data..."}],
+# Parse and validate with Pydantic
+result = ProductReview.model_validate_json(response.choices[0].message.content)
+print(result)
+```
+
+</TabItem>
+</Tabs>
+
+### Option 2: Helper Function
+
+Create a reusable helper:
+
+```python
+import litellm
+import json
+from typing import Union, Type, Dict
+from pydantic import BaseModel
+
+def completion_with_schema(
+    model: str,
+    messages: list,
+    schema: Union[Type[BaseModel], dict],
+    api_base: str = None,
+    **kwargs
+):
+    """
+    Workaround for vLLM models without native response_format support.
+    Manually injects JSON schema into the messages.
+    """
+    # Convert Pydantic to dict if needed
+    if isinstance(schema, type) and issubclass(schema, BaseModel):
+        schema_dict = schema.model_json_schema()
+        pydantic_class = schema
+    else:
+        schema_dict = schema
+        pydantic_class = None
+
+    # Add schema instruction to messages
+    schema_message = {
+        "role": "user",
+        "content": f"""Output valid JSON matching this schema:
+
+```json
+{json.dumps(schema_dict, indent=2)}
+```
+
+Rules:
+- Output ONLY the JSON object
+- No markdown formatting
+- No explanations
+- Match the schema exactly"""
+    }
+
+    # Clone messages and add schema
+    messages_with_schema = messages + [schema_message]
+
+    # Call LiteLLM with drop_params enabled
+    litellm.drop_params = True
+    response = litellm.completion(
+        model=model,
+        api_base=api_base,
+        messages=messages_with_schema,
+        temperature=kwargs.get("temperature", 0),
+        **{k: v for k, v in kwargs.items() if k != "temperature"}
+    )
+
+    # Parse response
+    content = response.choices[0].message.content
+
+    # Try to extract JSON if wrapped in markdown
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError:
+        # Try to extract from code block
+        import re
+        match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+        if match:
+            result = json.loads(match.group(1))
+        else:
+            # Try to find any JSON object
+            match = re.search(r'\{.*\}', content, re.DOTALL)
+            if match:
+                result = json.loads(match.group(0))
+            else:
+                raise ValueError(f"No valid JSON found in response: {content}")
+
+    # Validate with Pydantic if provided
+    if pydantic_class:
+        return pydantic_class.model_validate(result)
+
+    return result
+
+# Usage
+class User(BaseModel):
+    name: str
+    age: int
+    email: str
+
+result = completion_with_schema(
+    model="hosted_vllm/my-model",
+    api_base="http://localhost:8000",
+    messages=[
+        {"role": "user", "content": "Extract: John Doe, 30, john@example.com"}
+    ],
+    schema=User
+)
+
+print(result)  # User(name='John Doe', age=30, email='john@example.com')
+```
+
+### Option 3: Use vLLM's Native Support (If Available)
+
+Some newer vLLM versions and certain models DO support `guided_json` or `response_format`:
+
+```python
+# Check if your vLLM server supports it
+response = litellm.completion(
+    model="hosted_vllm/qwen2.5-coder",  # Example model with support
+    api_base="http://localhost:8000",
+    messages=[{"role": "user", "content": "Extract data"}],
     response_format={
         "type": "json_schema",
         "json_schema": {
             "name": "extraction",
-            "schema": {...}
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                },
+                "required": ["name"]
+            }
         }
     }
 )
+# If this works without error, your model supports it natively
 ```
+
+Check vLLM documentation for models with `guided_decoding` support:
+- https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#extra-parameters
 
 ---
 
-## Validation & Error Handling
+## What Would Need to Be Implemented
 
-### Enable Client-Side Validation
+To make automatic prompt injection work for vLLM (like it does for Gemini), the following changes would be needed:
 
-```python
-import litellm
+### 1. Add Support Check to vLLM Transformation
 
-# Validate responses match schema
-litellm.enable_json_schema_validation = True
-
-try:
-    response = litellm.completion(
-        model="hosted_vllm/my-model",
-        messages=[...],
-        response_format=MySchema
-    )
-except litellm.exceptions.JSONSchemaValidationError as e:
-    print(f"Response didn't match schema: {e}")
-```
-
-### Handle Markdown Wrapping
-
-Some models wrap JSON in markdown code blocks:
+File: `/litellm/llms/hosted_vllm/chat/transformation.py`
 
 ```python
-import json
-import re
+from litellm.utils import supports_response_schema
+from litellm.litellm_core_utils.prompt_templates.factory import response_schema_prompt
 
-def extract_json(text: str) -> dict:
-    """Extract JSON from text that might have markdown code blocks"""
-    # Try direct parse first
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+class HostedVLLMChatConfig(OpenAIGPTConfig):
 
-    # Try to extract from markdown code block
-    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group(1))
+    def transform_request(
+        self,
+        model: str,
+        messages: List[AllMessageValues],
+        optional_params: dict,
+        litellm_params: dict,
+        headers: dict,
+    ) -> dict:
+        # Existing transform logic...
 
-    # Try to find any JSON object
-    json_match = re.search(r'\{.*\}', text, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group(0))
+        # NEW: Check for response_schema support
+        if "response_schema" in optional_params:
+            _supports = supports_response_schema(
+                model=model,
+                custom_llm_provider="hosted_vllm"
+            )
+            if _supports is False:
+                # Inject schema into messages
+                schema_message = response_schema_prompt(
+                    model=model,
+                    response_schema=optional_params.get("response_schema")
+                )
+                messages.append({
+                    "role": "user",
+                    "content": schema_message
+                })
+                optional_params.pop("response_schema")
 
-    raise ValueError("No valid JSON found in response")
-
-# Use it
-response = litellm.completion(...)
-result = extract_json(response.choices[0].message.content)
+        # Continue with rest of transformation...
 ```
 
----
+### 2. Add Model Registry Support
 
-## Troubleshooting
+Users would need to register their models with feature flags:
 
-### Model ignores JSON schema
+```python
+litellm.register_model({
+    "hosted_vllm/my-llama-model": {
+        "supports_function_calling": False,
+        "supports_response_schema": False,
+    }
+})
+```
 
-**Solution**: Make your custom template more explicit:
+### 3. Add Custom Prompt Templates
+
+Support for customizing the injection format:
 
 ```python
 litellm.custom_prompt_dict = {
-    "response_schema_prompt": {
+    "hosted_vllm/my-model/response_schema_prompt": {
         "roles": {
             "user": {
-                "pre_message": (
-                    "CRITICAL INSTRUCTION: You MUST respond with ONLY a JSON object.\n"
-                    "Required JSON Schema:\n\n"
-                ),
-                "post_message": (
-                    "\n\nYour response MUST:\n"
-                    "1. Be ONLY a JSON object (start with { and end with })\n"
-                    "2. NOT include any text before or after the JSON\n"
-                    "3. NOT use markdown code blocks\n"
-                    "4. Match the schema exactly\n\n"
-                    "Begin your JSON response now:"
-                )
+                "pre_message": "Output JSON with this schema:\n",
+                "post_message": "\n\nOutput valid JSON only."
             }
         }
     }
 }
 ```
 
-### Response has extra text
-
-Try adding a system message:
-
-```python
-messages = [
-    {"role": "system", "content": "You are a JSON-only API. You respond exclusively with valid JSON objects."},
-    {"role": "user", "content": "..."}
-]
-```
-
-### Model doesn't support required schema fields
-
-Use `temperature=0` for more consistent output:
-
-```python
-response = litellm.completion(
-    model="...",
-    messages=[...],
-    response_format={...},
-    temperature=0,  # More deterministic
-    top_p=0.95,
-    max_tokens=1000
-)
-```
-
 ---
 
-## Checking Feature Support
+## Testing Your Setup
 
-Verify what your model supports:
+### Check What Your Model Supports
 
 ```python
 import litellm
 
 model = "hosted_vllm/my-model"
 
-# Check specific features
-print(f"Function calling: {litellm.supports_function_calling(model)}")
+# Check feature support
 print(f"Response schema: {litellm.supports_response_schema(model)}")
-print(f"Vision: {litellm.supports_vision(model)}")
+print(f"Function calling: {litellm.supports_function_calling(model)}")
 
-# Get all supported OpenAI params
+# Get supported parameters
 params = litellm.get_supported_openai_params(model)
 print(f"Supported params: {params}")
+
+# Note: These will return True for hosted_vllm because it inherits
+# from OpenAI config, but your actual model might not support them
+```
+
+### Test JSON Output Quality
+
+```python
+import litellm
+import json
+
+def test_json_output(model: str, api_base: str):
+    """Test if model can follow JSON schema instructions"""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "colors": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 3,
+                "maxItems": 3
+            }
+        },
+        "required": ["colors"]
+    }
+
+    messages = [
+        {"role": "user", "content": "List 3 primary colors"},
+        {
+            "role": "user",
+            "content": f"Respond with JSON: {json.dumps(schema)}"
+        }
+    ]
+
+    response = litellm.completion(
+        model=model,
+        api_base=api_base,
+        messages=messages,
+        temperature=0
+    )
+
+    content = response.choices[0].message.content
+    print(f"Raw response: {content}")
+
+    try:
+        result = json.loads(content)
+        print(f"✅ Valid JSON: {result}")
+        return True
+    except json.JSONDecodeError as e:
+        print(f"❌ Invalid JSON: {e}")
+        return False
+
+# Test it
+test_json_output(
+    model="hosted_vllm/my-model",
+    api_base="http://localhost:8000"
+)
 ```
 
 ---
 
-## Best Practices
+## Best Practices for Manual Injection
 
-1. **Use Pydantic models** - They provide better type safety and validation
-2. **Keep schemas simple** - Complex nested schemas are harder for models to follow
-3. **Set temperature=0** - More deterministic for structured output
-4. **Add examples** - Include example JSON in your prompt for better results
-5. **Validate responses** - Always validate with `litellm.enable_json_schema_validation = True`
-6. **Test your template** - Different models respond better to different instruction styles
-7. **Consider fine-tuning** - For production use, fine-tune your model on structured output tasks
+1. **Be Explicit in Instructions**
+   ```python
+   content = """Output ONLY a JSON object.
+   Do not include:
+   - Markdown code blocks (```json)
+   - Explanations or comments
+   - Text before or after the JSON
+
+   Schema: {...}"""
+   ```
+
+2. **Use Low Temperature**
+   ```python
+   temperature=0  # More deterministic
+   ```
+
+3. **Add System Message**
+   ```python
+   messages = [
+       {
+           "role": "system",
+           "content": "You are a JSON API. You only respond with valid JSON."
+       },
+       # ... rest of messages
+   ]
+   ```
+
+4. **Handle Markdown Wrapping**
+   ```python
+   import re
+
+   def extract_json(text: str) -> dict:
+       try:
+           return json.loads(text)
+       except json.JSONDecodeError:
+           # Try markdown block
+           match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+           if match:
+               return json.loads(match.group(1))
+           raise
+   ```
+
+5. **Validate Responses**
+   ```python
+   from pydantic import BaseModel, ValidationError
+
+   try:
+       result = MySchema.model_validate_json(response_text)
+   except ValidationError as e:
+       print(f"Schema validation failed: {e}")
+   ```
 
 ---
 
-## Related Documentation
+## Comparison: What Works Where
 
-- [JSON Mode (General)](../completion/json_mode.md)
-- [Function Calling](../completion/function_call.md)
+| Feature | Vertex AI Gemini | vLLM (hosted) | Status |
+|---------|------------------|---------------|--------|
+| **Automatic prompt injection** | ✅ Yes | ❌ No | Gemini only |
+| **Manual prompt injection** | ✅ Yes | ✅ Yes | Works everywhere |
+| **Native response_format** | ⚠️ Some models | ⚠️ Some models | Model-dependent |
+| **Custom prompt templates** | ✅ Yes | ❌ No | Needs implementation |
+| **Feature detection** | ✅ Yes | ⚠️ Inherits OpenAI | May be inaccurate |
+
+---
+
+## Related Resources
+
+- [vLLM Guided Decoding Docs](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html#extra-parameters)
+- [LiteLLM JSON Mode (General)](../completion/json_mode.md)
+- [LiteLLM Function Calling](../completion/function_call.md)
 - [vLLM Provider Overview](./vllm.md)
-- [Custom Prompt Templates](./vllm.md#custom-prompt-templates)
+
+---
+
+## Contributing
+
+If you'd like to implement automatic prompt injection for vLLM, the implementation would involve:
+
+1. Modifying `/litellm/llms/hosted_vllm/chat/transformation.py`
+2. Adding support check logic (similar to Gemini)
+3. Using the existing `response_schema_prompt()` function
+4. Adding tests in `/tests/llm_translation/test_vllm.py`
+
+The core logic already exists in `/litellm/litellm_core_utils/prompt_templates/factory.py` - it just needs to be wired up for vLLM.
+
+See the Gemini implementation as a reference:
+- `/litellm/llms/vertex_ai/gemini/transformation.py` lines 463-472
