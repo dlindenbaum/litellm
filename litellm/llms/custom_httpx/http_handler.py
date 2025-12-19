@@ -295,6 +295,7 @@ class AsyncHTTPHandler:
     ):
         self.timeout = timeout
         self.event_hooks = event_hooks
+        self.ssl_verify = ssl_verify  # Store ssl_verify for retry scenarios
         self.client = self.create_client(
             timeout=timeout,
             event_hooks=event_hooks,
@@ -407,7 +408,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, event_hooks=self.event_hooks
+                timeout=timeout, event_hooks=self.event_hooks, ssl_verify=self.ssl_verify
             )
             try:
                 return await self.single_connection_post_request(
@@ -477,7 +478,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, event_hooks=self.event_hooks
+                timeout=timeout, event_hooks=self.event_hooks, ssl_verify=self.ssl_verify
             )
             try:
                 return await self.single_connection_post_request(
@@ -541,7 +542,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, event_hooks=self.event_hooks
+                timeout=timeout, event_hooks=self.event_hooks, ssl_verify=self.ssl_verify
             )
             try:
                 return await self.single_connection_post_request(
@@ -592,10 +593,10 @@ class AsyncHTTPHandler:
         try:
             if timeout is None:
                 timeout = self.timeout
-            
+
             # Prepare data/content parameters to prevent httpx DeprecationWarning (memory leak fix)
             request_data, request_content = _prepare_request_data_and_content(data, content)
-            
+
             req = self.client.build_request(
                 "DELETE", url, data=request_data, json=json, params=params, headers=headers, timeout=timeout, content=request_content  # type: ignore
             )
@@ -605,7 +606,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, event_hooks=self.event_hooks
+                timeout=timeout, event_hooks=self.event_hooks, ssl_verify=self.ssl_verify
             )
             try:
                 return await self.single_connection_post_request(
